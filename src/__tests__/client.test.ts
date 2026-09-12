@@ -373,9 +373,16 @@ describe('Client', () => {
   });
 
   it('should not include API key header when no key provided', () => {
-    const client = new Client();
-    const headers = (client as any).buildHeaders();
-    expect(headers['X-API-KEY']).toBeUndefined();
+    const previousKey = process.env.AGNT5_API_KEY;
+    delete process.env.AGNT5_API_KEY;
+    try {
+      const client = new Client();
+      const headers = (client as any).buildHeaders();
+      expect(headers['X-API-KEY']).toBeUndefined();
+    } finally {
+      if (previousKey === undefined) delete process.env.AGNT5_API_KEY;
+      else process.env.AGNT5_API_KEY = previousKey;
+    }
   });
 
   it('should merge extra headers', () => {
