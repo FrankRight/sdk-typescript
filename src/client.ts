@@ -47,7 +47,18 @@ export interface InvocationOptions {
   idempotencyKey?: string;
 }
 
+function responseWaitMs(value: number = 300000): number {
+  if (!Number.isInteger(value) || value < 0 || value > 86400000) {
+    throw new RangeError('waitTimeoutMs must be an integer from 0 to 86400000');
+  }
+  return value;
+}
+
 export interface RunOptions extends InvocationOptions {
+  /** Gateway response wait in milliseconds (default 300000); zero returns an accepted receipt. */
+  waitTimeoutMs?: number;
+  /** HTTP deadline in milliseconds; defaults to at least the response wait plus 10 seconds. */
+  timeoutMs?: number;
   /** Component type (default: "function") */
   componentType?: 'function' | 'workflow' | 'agent' | 'tool';
   /** Explicit deployment ID for this call. Ambient AGNT5_DEPLOYMENT_ID is not used for component execution. */
@@ -71,6 +82,7 @@ export interface RunOptions extends InvocationOptions {
 
 /** Run execution status values */
 export type RunStatus =
+  | 'pending'
   | 'enqueued'
   | 'queued'
   | 'started'
@@ -206,7 +218,7 @@ export class RunResponse<T = any> {
 
   /** True if the run is still in progress */
   get isPending(): boolean {
-    return ['enqueued', 'queued', 'started', 'running', 'paused', 'awaiting_input'].includes(this.status);
+    return ['pending', 'enqueued', 'queued', 'started', 'running', 'paused', 'awaiting_input'].includes(this.status);
   }
 
   /** True if the run failed, was cancelled, or timed out */
@@ -462,6 +474,8 @@ export class Client {
    * Returns a typed RunResponse with metadata (traceId, durationMs, status).
    */
   async run<T = any>(component: string, inputData: any = {}, options: RunOptions = {}): Promise<RunResponse<T>> {
+    const waitMs = responseWaitMs(options.waitTimeoutMs);
+    const timeoutMs = options.timeoutMs ?? Math.max(this.timeout, waitMs + 10000);
     return this.withRetry(async () => {
       const componentType = options.componentType || 'function';
       const url = `${this.gatewayUrl}/v1/${componentType}s/${component}/run`;
@@ -479,12 +493,15 @@ export class Client {
 
       const response = await fetch(url, {
         method: 'POST',
-        headers: this.buildHeaders(extra, options.tenant, {
-          deploymentId: options.deploymentId,
-          includeAmbientDeploymentId: false,
-        }),
+        headers: {
+          ...this.buildHeaders(extra, options.tenant, {
+            deploymentId: options.deploymentId,
+            includeAmbientDeploymentId: false,
+          }),
+          'X-AGNT5-Wait-Timeout-Ms': String(waitMs),
+        },
         body: JSON.stringify(inputData),
-        signal: AbortSignal.timeout(this.timeout),
+        signal: AbortSignal.timeout(timeoutMs),
       });
 
       if (!response.ok) {
@@ -495,45 +512,8 @@ export class Client {
 
       const data = (await response.json()) as RawRunResponse;
       const result = new RunResponse<T>(data);
-      if (response.status === 202 && result.runId) {
-        return await this.waitForDetachedRun<T>(result.runId, this.timeout);
-      }
       return result;
     }, options.maxRetries);
-  }
-
-  /** Wait for a durably detached /run receipt without retaining its gateway tail. */
-  private async waitForDetachedRun<T>(runId: string, timeoutMs: number): Promise<RunResponse<T>> {
-    const deadline = Date.now() + timeoutMs;
-    let pollIntervalMs = 100;
-    let terminalStatusObserved = false;
-
-    while (true) {
-      const remainingMs = deadline - Date.now();
-      if (remainingMs <= 0) {
-        throw new RunError(`Timeout waiting for run to complete after ${timeoutMs}ms`, runId);
-      }
-
-      if (!terminalStatusObserved) {
-        const status = await this.getStatus(runId);
-        terminalStatusObserved = ['completed', 'failed', 'cancelled', 'timeout'].includes(status.status);
-      }
-
-      if (terminalStatusObserved) {
-        try {
-          return await this.getResult<T>(runId);
-        } catch (error) {
-          // Terminal journal state can become visible just before the result
-          // projection. Keep waiting within the original run() deadline.
-          if (!(error instanceof RunError)) {
-            throw error;
-          }
-        }
-      }
-
-      await new Promise(resolve => setTimeout(resolve, Math.min(pollIntervalMs, remainingMs)));
-      pollIntervalMs = Math.min(Math.ceil(pollIntervalMs * 1.5), 2_000);
-    }
   }
 
   /**
@@ -701,8 +681,11 @@ export class Client {
    * Stream text chunks from a component using SSE.
    * For typed events, use events() instead.
    */
-  async *stream(component: string, inputData: any = {}, options: Pick<RunOptions, 'componentType' | 'tenant' | 'deploymentId' | 'idempotencyKey'> = {}): AsyncGenerator<string, void, unknown> {
+  async *stream(component: string, inputData: any = {}, options: Pick<RunOptions, 'componentType' | 'tenant' | 'deploymentId' | 'idempotencyKey' | 'waitTimeoutMs' | 'timeoutMs'> = {}): AsyncGenerator<string, void, unknown> {
     for await (const event of this.events(component, inputData, options)) {
+      if (event.eventType === 'stream.wait_expired' || event.eventType === 'stream.detached') {
+        throw new RunError('Response wait ended; run continues', event.runId);
+      }
       if (event.eventType === 'run.failed') {
         throw streamingRunError(event.data, { run_id: event.runId });
       }
@@ -732,28 +715,34 @@ export class Client {
    * }
    * ```
    */
-  async *events(component: string, inputData: any = {}, options: Pick<RunOptions, 'componentType' | 'tenant' | 'deploymentId' | 'idempotencyKey'> = {}): AsyncGenerator<ReceivedEvent, void, unknown> {
+  async *events(component: string, inputData: any = {}, options: Pick<RunOptions, 'componentType' | 'tenant' | 'deploymentId' | 'idempotencyKey' | 'waitTimeoutMs' | 'timeoutMs'> = {}): AsyncGenerator<ReceivedEvent, void, unknown> {
+    const waitMs = responseWaitMs(options.waitTimeoutMs);
+    const timeoutMs = options.timeoutMs ?? Math.max(this.timeout, waitMs + 10000);
     const componentType = options.componentType || 'function';
     const url = `${this.gatewayUrl}/v1/${componentType}s/${component}/stream`;
 
     const response = await fetch(url, {
       method: 'POST',
-      headers: this.buildHeaders(
-        options.idempotencyKey !== undefined
-          ? { 'Idempotency-Key': options.idempotencyKey }
-          : undefined,
-        options.tenant,
-        {
-          deploymentId: options.deploymentId,
-          includeAmbientDeploymentId: false,
-        },
-      ),
+      headers: {
+        ...this.buildHeaders(
+          options.idempotencyKey !== undefined ? { 'Idempotency-Key': options.idempotencyKey } : undefined,
+          options.tenant,
+          { deploymentId: options.deploymentId, includeAmbientDeploymentId: false },
+        ),
+        'X-AGNT5-Wait-Timeout-Ms': String(waitMs),
+      },
       body: JSON.stringify(inputData),
-      signal: AbortSignal.timeout(300000), // 5 minute timeout for streaming
+      signal: AbortSignal.timeout(timeoutMs),
     });
 
     if (!response.ok) {
       throw new RunError(`HTTP ${response.status}: Streaming request failed`);
+    }
+
+    if (response.status === 202) {
+      const data = await response.json() as Record<string, any>;
+      yield { eventType: 'stream.detached', runId: data.run_id, data, contentIndex: 0, sequence: 0 };
+      return;
     }
 
     if (!response.body) {

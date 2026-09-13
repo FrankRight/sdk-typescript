@@ -190,3 +190,27 @@ a new version alone does not resolve a scan or approval hold.
 
 See [npm publish-time scanning](https://github.blog/changelog/2026-07-28-npm-publish-time-malware-scanning-and-dual-use-metadata/)
 and [staged publishing](https://docs.npmjs.com/staged-publishing/).
+
+## Response wait
+
+Run and stream calls wait up to **5 minutes** by default. Set the per-call wait
+to any value from zero to 24 hours. Zero returns a pending receipt immediately
+after acceptance. This controls response waiting, not the workflow execution
+deadline: accepted work continues when the wait expires or the client disconnects.
+
+```typescript
+const options = { componentType: 'workflow' as const, waitTimeoutMs: 60000 };
+const result = await client.run('process_order', order, options);
+for await (const event of client.events('process_order', order, options)) {
+  console.log(event.eventType, event.runId);
+}
+```
+
+`waitTimeoutMs` uses whole milliseconds. Run calls return `202` pending receipts
+directly, without additional polling. Event streams emit `stream.wait_expired`
+when the wait expires, or `stream.detached` for a `202` receipt. Use the run ID
+to read status/results. Chunk-only `stream` raises `RunError` with the run ID
+when waiting ends.
+
+The default HTTP timeout allows at least the wait plus 10 seconds, or the client
+timeout if longer. Pass `timeoutMs: 75000` to set it explicitly.
