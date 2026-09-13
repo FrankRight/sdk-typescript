@@ -7,6 +7,27 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-13
+
+### Fixed
+
+- Build the native binding against SDK core 0.3.1 so pull workers drain accepted jobs during graceful shutdown, while idle polls stop promptly (AGNT5-1129).
+
+### Added
+
+- Configure response waiting for run and stream requests with `waitTimeoutMs` (zero through 24 hours); `waitTimeoutMs: 0` returns after acceptance. Response waits do not change the workflow execution deadline.
+
+### Changed
+
+- `Client.run()` returns HTTP 202 pending receipts directly instead of polling until completion. `RunStatus` now includes `pending`.
+- Run and stream response waits default to five minutes. Chunk-only `Client.stream()` raises `RunError` with the accepted run ID when the response wait expires or detaches; `Client.events()` exposes `stream.wait_expired` and `stream.detached` events.
+
+### Upgrade
+
+- Configurable response waits require a gateway that supports `X-AGNT5-Wait-Timeout-Ms`.
+- This minor release changes response-wait behavior. Check `RunResponse.isPending` before consuming output, retain `runId`, and use `getStatus()` / `getResult()` to read the eventual outcome when a call returns pending.
+- Set `waitTimeoutMs` per call to select the gateway wait, and `timeoutMs` to retain a shorter explicit HTTP deadline. Handle stream wait events or `RunError` without resubmitting accepted work.
+
 ## [0.9.2] - 2026-09-11
 
 ### Fixed
