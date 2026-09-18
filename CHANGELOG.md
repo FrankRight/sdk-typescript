@@ -7,6 +7,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-09-18
+
+### Fixed
+
+- Qualify the default judge model with its provider (`openai/gpt-4o-mini`) so the managed judge presets `correctness`, `goal_success` and `agent_judge` run without an explicit `model`. Previously every item failed with "Model must include provider prefix" (AGNT5-1225).
+
 ## [0.10.0] - 2026-09-13
 
 ### Fixed
