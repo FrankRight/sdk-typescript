@@ -587,7 +587,8 @@ export async function llmJudge(
       explanation: 'llm_judge requires `config.criteria` or `config.prompt_template`',
     });
   }
-  const providerName = typeof cfg.provider === 'string' ? cfg.provider : 'openai';
+  const providerExplicit = typeof cfg.provider === 'string';
+  const providerName = providerExplicit ? (cfg.provider as string) : 'openai';
   const modelName = typeof cfg.model === 'string' ? cfg.model : '';
   if (!modelName) {
     return new ScorerResult({
@@ -680,7 +681,7 @@ export async function llmJudge(
   let response: { text: string };
   try {
     response = await lm.generate({
-      model: modelName,
+      model: judgeModelIdentifier(providerName, modelName, providerExplicit),
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userContent },
@@ -705,6 +706,31 @@ function formatJudgeValue(v: any): string {
   } catch {
     return String(v);
   }
+}
+
+/**
+ * The `provider/model` identifier the LM expects, from a judge's `provider`
+ * and `model` config. The managed presets (`correctness`, `goal_success`,
+ * `agent_judge`, `faithfulness`) default to `provider: 'openai'` and a bare
+ * `model: 'gpt-4o-mini'`, and `LM.generate` rejects a model without a
+ * provider prefix — so every preset failed with "Model must include provider
+ * prefix" unless the experiment set `config.model` itself. A model that
+ * already carries a prefix is kept as given when no provider was configured,
+ * matching the Python SDK's `_judge_model`.
+ */
+export function judgeModelIdentifier(
+  provider: string,
+  model: string,
+  providerExplicit: boolean,
+): string {
+  const trimmedModel = model.trim();
+  const trimmedProvider = provider.trim().toLowerCase();
+  if (trimmedModel.includes('/')) {
+    if (!providerExplicit || trimmedModel.toLowerCase().startsWith(`${trimmedProvider}/`)) {
+      return trimmedModel;
+    }
+  }
+  return `${trimmedProvider}/${trimmedModel}`;
 }
 
 async function makeLmForProvider(

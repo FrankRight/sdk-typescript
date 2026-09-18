@@ -11,6 +11,7 @@ import {
   jsonValid,
   jsonSchema,
   llmJudge,
+  judgeModelIdentifier,
   correctness,
   faithfulness,
   goalSuccess,
@@ -1014,5 +1015,52 @@ describe('Trace helpers', () => {
     expect(toolTrajectoryAnyOrder(actual, ['lookup', 'search', 'search'])).toBe(true);
     expect(toolTrajectoryAnyOrder(actual, ['lookup', 'lookup'])).toBe(false);
     expect(toolTrajectoryMatches(actual, ['summarize', 'search'], 'in_order')).toBe(true);
+  });
+});
+
+// AGNT5-1225: the managed judge presets default to provider 'openai' and a
+// bare model 'gpt-4o-mini', but the LM rejects a model without its provider
+// prefix, so every preset failed with "Model must include provider prefix"
+// unless the experiment configured `model` itself.
+describe('judge model identifier', () => {
+  it('prefixes a bare model with its provider', () => {
+    expect(judgeModelIdentifier('openai', 'gpt-4o-mini', false)).toBe('openai/gpt-4o-mini');
+    expect(judgeModelIdentifier('anthropic', 'claude-3-5-haiku', true)).toBe('anthropic/claude-3-5-haiku');
+  });
+
+  it('keeps an already prefixed model when no provider was configured', () => {
+    expect(judgeModelIdentifier('openai', 'anthropic/claude-3-5-haiku', false)).toBe('anthropic/claude-3-5-haiku');
+  });
+
+  it('keeps a prefixed model that agrees with the configured provider', () => {
+    expect(judgeModelIdentifier('OpenAI', 'openai/gpt-4o-mini', true)).toBe('openai/gpt-4o-mini');
+  });
+
+  it('llmJudge sends the qualified model to the LM', async () => {
+    const seen: string[] = [];
+    const stubLm = {
+      generate: async (req: { model: string }) => {
+        seen.push(req.model);
+        return { text: '{"score": 1, "passed": true, "explanation": "ok"}' };
+      },
+    };
+    const ctx = { runId: 'r', correlationId: 'c', attempt: 0, log: () => {}, llmJudgeLm: stubLm } as any;
+    await llmJudge({ output: 'x', config: { criteria: 'ok?', model: 'gpt-4o-mini' } }, ctx);
+    await llmJudge({ output: 'x', config: { criteria: 'ok?', provider: 'openai', model: 'gpt-4o-mini' } }, ctx);
+    expect(seen).toEqual(['openai/gpt-4o-mini', 'openai/gpt-4o-mini']);
+  });
+
+  it('the correctness preset runs with its default model', async () => {
+    const seen: string[] = [];
+    const stubLm = {
+      generate: async (req: { model: string }) => {
+        seen.push(req.model);
+        return { text: '{"score": 1, "passed": true, "explanation": "ok"}' };
+      },
+    };
+    const ctx = { runId: 'r', correlationId: 'c', attempt: 0, log: () => {}, llmJudgeLm: stubLm } as any;
+    const result = await correctness({ input: 'What is 2+2?', output: '4', expected: '4', config: {} }, ctx);
+    expect(result.label).not.toBe('config_error');
+    expect(seen).toEqual(['openai/gpt-4o-mini']);
   });
 });
