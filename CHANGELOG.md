@@ -7,6 +7,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.10.4] - 2026-09-22
+
+### Fixed
+
+- A panic in the native core during a durable activation now fails the call with the panic's own message, `native begin_activation panicked: <message>`, instead of napi's generic "Panic in async function", and every native panic is logged with its source location through the SDK logger. The engine connection is dropped after such a panic, so the next activation reconnects instead of reusing a channel the panic may have left broken (AGNT5-1260).
+
 ## [0.10.3] - 2026-09-22
 
 ### Fixed
