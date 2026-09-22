@@ -22,6 +22,8 @@ use agnt5_sdk_core::pb::{
 };
 #[cfg(feature = "durable-activation-v1")]
 use agnt5_sdk_core::runtime_adapter::{ActivationAdapter, ActivationDecision};
+#[cfg(feature = "durable-activation-v1")]
+use futures_util::FutureExt;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -673,6 +675,110 @@ impl Worker {
             .expect("activation adapter initialized")
             .clone())
     }
+
+    /// Runs one activation call and turns a panic inside it into an activation
+    /// error carrying the panic's message. napi reported such a panic only as
+    /// "Panic in async function", which failed the run with no clue to the
+    /// cause (AGNT5-1260). The cached engine connection is dropped as well, so
+    /// the next call reconnects instead of reusing a channel the panic may have
+    /// left broken.
+    async fn guard_activation_panic<T>(
+        &self,
+        operation: &str,
+        run_id: &str,
+        call: impl std::future::Future<Output = napi::Result<T>>,
+    ) -> napi::Result<T> {
+        match catch_panic(call).await {
+            Ok(result) => result,
+            Err(message) => {
+                tracing::error!(
+                    operation,
+                    run_id,
+                    panic = %message,
+                    "native activation call panicked; reconnecting the engine client"
+                );
+                *self.activation_adapter.lock().await = None;
+                Err(native_activation_bridge_error(
+                    "UNKNOWN_OUTCOME",
+                    format!("native {operation} panicked: {message}"),
+                    "",
+                    0,
+                ))
+            }
+        }
+    }
+}
+
+#[cfg(feature = "durable-activation-v1")]
+#[napi]
+impl Worker {
+    /// Begin one journal-authoritative durable activation.
+    #[napi]
+    pub async fn begin_activation(
+        &self,
+        request: NativeBeginActivationRequest,
+    ) -> Result<NativeActivationDecision> {
+        let run_id = request.run_id.clone();
+        self.guard_activation_panic(
+            "begin_activation",
+            &run_id,
+            self.begin_activation_unguarded(request),
+        )
+        .await
+    }
+
+    /// Commit one accepted durable activation completion.
+    #[napi]
+    pub async fn complete_activation(
+        &self,
+        request: NativeCompleteActivationRequest,
+    ) -> Result<NativeActivationCompletionReceipt> {
+        let run_id = request.run_id.clone();
+        self.guard_activation_panic(
+            "complete_activation",
+            &run_id,
+            self.complete_activation_unguarded(request),
+        )
+        .await
+    }
+
+    /// Commit one fenced durable activation failure.
+    #[napi]
+    pub async fn fail_activation(
+        &self,
+        request: NativeFailActivationRequest,
+    ) -> Result<NativeActivationFailureReceipt> {
+        let run_id = request.run_id.clone();
+        self.guard_activation_panic(
+            "fail_activation",
+            &run_id,
+            self.fail_activation_unguarded(request),
+        )
+        .await
+    }
+}
+
+/// Awaits `call`, returning the message of any panic raised while polling it.
+#[cfg(feature = "durable-activation-v1")]
+async fn catch_panic<T>(
+    call: impl std::future::Future<Output = T>,
+) -> std::result::Result<T, String> {
+    std::panic::AssertUnwindSafe(call)
+        .catch_unwind()
+        .await
+        .map_err(|payload| panic_message(payload.as_ref()))
+}
+
+/// The message a panic was raised with. `panic!("literal")` carries a
+/// `&'static str`; formatted panics, `unwrap` and `expect` carry a `String`.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "panic with a non-string payload".to_string()
+    }
 }
 
 #[cfg(feature = "durable-activation-v1")]
@@ -802,11 +908,8 @@ fn native_activation_status(status: agnt5_sdk_core::pb::ActivationStatus) -> &'s
 }
 
 #[cfg(feature = "durable-activation-v1")]
-#[napi]
 impl Worker {
-    /// Begin one journal-authoritative durable activation.
-    #[napi]
-    pub async fn begin_activation(
+    async fn begin_activation_unguarded(
         &self,
         request: NativeBeginActivationRequest,
     ) -> Result<NativeActivationDecision> {
@@ -847,9 +950,7 @@ impl Worker {
         native_activation_decision(decision)
     }
 
-    /// Commit one accepted durable activation completion.
-    #[napi]
-    pub async fn complete_activation(
+    async fn complete_activation_unguarded(
         &self,
         request: NativeCompleteActivationRequest,
     ) -> Result<NativeActivationCompletionReceipt> {
@@ -892,9 +993,7 @@ impl Worker {
         })
     }
 
-    /// Commit one fenced durable activation failure.
-    #[napi]
-    pub async fn fail_activation(
+    async fn fail_activation_unguarded(
         &self,
         request: NativeFailActivationRequest,
     ) -> Result<NativeActivationFailureReceipt> {
@@ -1411,8 +1510,31 @@ pub fn initialize(service_name: String, service_version: Option<String>) -> Resu
     // Initialize telemetry (installs the single global tracing subscriber).
     agnt5_sdk_core::init_telemetry(&service_name, &version)
         .map_err(|e| Error::from_reason(format!("Failed to init telemetry: {}", e)))?;
+    install_panic_hook();
 
     Ok(())
+}
+
+/// Logs every native panic, with where it was raised, through the SDK logger
+/// before the default hook prints it to stderr, which deployment logs did not
+/// keep (AGNT5-1260).
+fn install_panic_hook() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let location = info
+                .location()
+                .map(|location| format!("{}:{}", location.file(), location.line()))
+                .unwrap_or_default();
+            tracing::error!(
+                panic = %panic_message(info.payload()),
+                location,
+                "native panic"
+            );
+            previous(info);
+        }));
+    });
 }
 
 /// Get SDK version
@@ -1907,6 +2029,36 @@ impl Span {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A formatted panic carries a String, which napi reported only as "Panic
+    // in async function" (AGNT5-1260).
+    #[cfg(feature = "durable-activation-v1")]
+    #[tokio::test]
+    async fn catch_panic_keeps_the_panic_message() {
+        let formatted = catch_panic(async {
+            let pool: Vec<u32> = Vec::new();
+            #[allow(clippy::unnecessary_operation)]
+            pool[3];
+        })
+        .await;
+        assert_eq!(
+            formatted.unwrap_err(),
+            "index out of bounds: the len is 0 but the index is 3"
+        );
+
+        let literal = catch_panic(async { panic!("engine channel poisoned") }).await;
+        assert_eq!(literal.unwrap_err(), "engine channel poisoned");
+
+        let ok = catch_panic(async { 7 }).await;
+        assert_eq!(ok, Ok(7));
+    }
+
+    #[test]
+    fn panic_message_reads_string_and_str_payloads() {
+        assert_eq!(panic_message(&"literal"), "literal");
+        assert_eq!(panic_message(&String::from("formatted 42")), "formatted 42");
+        assert_eq!(panic_message(&42_u8), "panic with a non-string payload");
+    }
 
     #[cfg(feature = "durable-activation-v1")]
     #[tokio::test]
